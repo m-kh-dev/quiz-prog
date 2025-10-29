@@ -26,10 +26,21 @@ class JSBridge(QObject):
         super().__init__()
         self.display_lib = display_lib
         
-    @pyqtSlot(str, list)
-    def call_python_function(self, func_name: str, args: list):
-        """Called from JavaScript to execute Python functions"""
-        self.js_call_python.emit(func_name, args)
+    pythonResult = pyqtSignal(str, str, str)  # requestId, payloadJSON, errorJSON
+
+    @pyqtSlot(str, list, str)
+    def call_python(self, func_name: str, args: list, request_id: str):
+        """Handle Python function calls from JavaScript"""
+        try:
+            if func_name in self.display_lib.methods:
+                result = self.display_lib.methods[func_name](*args)
+                self.pythonResult.emit(request_id, json.dumps(result), json.dumps(None))
+            else:
+                err = {"type": "NoSuchMethod", "message": f"{func_name} not found"}
+                self.pythonResult.emit(request_id, json.dumps(None), json.dumps(err))
+        except Exception as e:
+            err = {"type": e.__class__.__name__, "message": str(e)}
+            self.pythonResult.emit(request_id, json.dumps(None), json.dumps(err))
         
     @pyqtSlot(str, result=str)
     def get_constant(self, name: str) -> str:
@@ -111,21 +122,57 @@ class DisplayLib:
                 else:
                     soup.insert(0, head_tag)
             
-        # Add JavaScript bridge and initialization
+        # Add webchannel script
+        webchannel_script = soup.new_tag('script')
+        webchannel_script['src'] = 'qrc:///qtwebchannel/qwebchannel.js'
+        
+        # Add bridge initialization script
         bridge_script = soup.new_tag('script')
         bridge_script.string = """
+        // Initialize when bridge is ready
+        function initializeBridge() {
+            if (window.pyBridge) {
+                if (typeof window.initDisplayLib === 'function') {
+                    window.initDisplayLib();
+                }
+                updateUI();
+            } else {
+                setTimeout(initializeBridge, 100);
+            }
+        }
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            new QWebChannel(qt.webChannelTransport, function(channel) {
+                window.pyBridge = channel.objects.pyBridge;
+                // Connect to pythonResult signal
+                window.pyBridge.pythonResult.connect(function(requestId, payload, error) {
+                    const pending = window._pendingCalls && window._pendingCalls.get(requestId);
+                    if (pending) {
+                        window._pendingCalls.delete(requestId);
+                        const errorObj = JSON.parse(error);
+                        if (errorObj) {
+                            pending.reject(errorObj);
+                        } else {
+                            pending.resolve(JSON.parse(payload));
+                        }
+                    }
+                });
+                initializeBridge();
+            });
+        });
+        
         // DisplayLib JavaScript Bridge
         if (typeof window.DisplayLib === 'undefined') {
+            window._pendingCalls = new Map();
+            let requestId = 0;
+            
             window.DisplayLib = {
-                constants: {},
-                variables: {},
                 callPython: function(funcName, ...args) {
                     return new Promise((resolve, reject) => {
                         if (window.pyBridge) {
-                            window.pyBridge.call_python_function(funcName, args);
-                            // For simplicity, we'll resolve immediately
-                            // In a real implementation, you'd handle async responses
-                            resolve(null);
+                            const reqId = 'req_' + (requestId++);
+                            window._pendingCalls.set(reqId, {resolve, reject});
+                            window.pyBridge.call_python(funcName, args, reqId);
                         } else {
                             reject('Python bridge not available');
                         }
@@ -153,23 +200,102 @@ class DisplayLib:
                     return false;
                 }
             };
+        }
+        
+        function updateUI() {
+            // Update constants
+            if (window.DisplayLib.getConstant) {
+                document.getElementById('appName').textContent = window.DisplayLib.getConstant('APP_NAME') || 'Unknown';
+                document.getElementById('version').textContent = window.DisplayLib.getConstant('VERSION') || 'Unknown';
+                document.getElementById('maxItems').textContent = window.DisplayLib.getConstant('MAX_ITEMS') || 'Unknown';
+                document.getElementById('piValue').textContent = window.DisplayLib.getConstant('PI') || 'Unknown';
+            }
             
-            // Initialize when bridge is ready
-            if (window.pyBridge) {
-                // Load initial data
-                setTimeout(() => {
-                    if (typeof window.initDisplayLib === 'function') {
-                        window.initDisplayLib();
-                    }
-                }, 100);
+            // Update variables
+            if (window.DisplayLib.getVariable) {
+                document.getElementById('counterValue').textContent = window.DisplayLib.getVariable('counter') || 'Unknown';
+                document.getElementById('userName').textContent = window.DisplayLib.getVariable('userName') || 'Unknown';
+                document.getElementById('currentTheme').textContent = window.DisplayLib.getVariable('theme') || 'Unknown';
+                
+                // Update items list
+                const items = window.DisplayLib.getVariable('items') || [];
+                const itemsList = document.getElementById('itemsList');
+                itemsList.innerHTML = '';
+                items.forEach(item => {
+                    const li = document.createElement('li');
+                    li.textContent = item;
+                    itemsList.appendChild(li);
+                });
             }
         }
+        
+        // Global functions for button handlers
+        window.incrementCounterHandler = function(amount) {
+            window.DisplayLib.callPython('incrementCounter', amount).then(result => {
+                updateUI();
+                document.getElementById('jsResults').textContent = `Counter incremented by ${amount}. New value: ${result}`;
+            }).catch(error => {
+                document.getElementById('jsResults').textContent = `Error: ${error.message}`;
+            });
+        };
+        
+        window.resetCounter = function() {
+            window.DisplayLib.setVariable('counter', 0);
+            updateUI();
+            document.getElementById('jsResults').textContent = 'Counter reset to 0';
+        };
+        
+        window.toggleTheme = function() {
+            const currentTheme = window.DisplayLib.getVariable('theme');
+            const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+            window.DisplayLib.callPython('changeTheme', newTheme).then(success => {
+                if (success) {
+                    updateUI();
+                    document.body.className = newTheme + '-theme';
+                    document.getElementById('jsResults').textContent = `Theme changed to ${newTheme}`;
+                }
+            });
+        };
+        
+        window.addNewItem = function() {
+            const input = document.getElementById('newItem');
+            const item = input.value.trim();
+            if (item) {
+                window.DisplayLib.callPython('addItem', item).then(success => {
+                    if (success) {
+                        updateUI();
+                        input.value = '';
+                        document.getElementById('jsResults').textContent = `Item "${item}" added successfully`;
+                    } else {
+                        document.getElementById('jsResults').textContent = 'Failed to add item: Maximum limit reached';
+                    }
+                });
+            }
+        };
+        
+        window.showMessageHandler = function() {
+            const input = document.getElementById('messageInput');
+            const message = input.value.trim();
+            if (message) {
+                window.DisplayLib.callPython('showMessage', message).then(result => {
+                    document.getElementById('jsResults').textContent = result;
+                    input.value = '';
+                });
+            }
+        };
+        
+        // Initialize when page loads
+        window.initDisplayLib = function() {
+            updateUI();
+        };
         """
         
         if soup.head:
+            soup.head.append(webchannel_script)
             soup.head.append(bridge_script)
         else:
             head_tag = soup.new_tag('head')
+            head_tag.append(webchannel_script)
             head_tag.append(bridge_script)
             if soup.html:
                 soup.html.insert(0, head_tag)
@@ -264,41 +390,11 @@ class DisplayWindow(QMainWindow):
             
     def display_html(self, html_content: str, tab_title: str = "Main Browser"):
         """Display HTML content in the specified tab"""
-        # Inject Qt WebChannel script
-        webchannel_script = """
-        <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
-        <script>
-        document.addEventListener('DOMContentLoaded', function() {
-            new QWebChannel(qt.webChannelTransport, function(channel) {
-                window.pyBridge = channel.objects.pyBridge;
-                // Initialize DisplayLib
-                if (typeof window.initDisplayLib === 'function') {
-                    window.initDisplayLib();
-                }
-            });
-        });
-        </script>
-        """
-        
-        # Insert webchannel script into HTML
-        soup = BeautifulSoup(html_content, 'html.parser')
-        if soup.head:
-            soup.head.append(BeautifulSoup(webchannel_script, 'html.parser'))
-        else:
-            head = soup.new_tag('head')
-            head.append(BeautifulSoup(webchannel_script, 'html.parser'))
-            if soup.html:
-                soup.html.insert(0, head)
-            else:
-                soup.insert(0, head)
-                
-        final_html = str(soup)
-        
         if tab_title in self.display_lib.web_views:
-            self.display_lib.web_views[tab_title].setHtml(final_html)
+            self.display_lib.web_views[tab_title].setHtml(html_content)
         else:
             web_view = self.add_browser_tab(tab_title)
-            web_view.setHtml(final_html)
+            web_view.setHtml(html_content)
 
 
 class DisplayLibDemo:
@@ -382,6 +478,7 @@ class DisplayLibDemo:
                     font-family: Arial, sans-serif; 
                     margin: 20px; 
                     background-color: #f5f5f5;
+                    transition: all 0.3s ease;
                 }
                 .container { 
                     max-width: 800px; 
@@ -390,6 +487,7 @@ class DisplayLibDemo:
                     padding: 20px; 
                     border-radius: 8px;
                     box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                    transition: all 0.3s ease;
                 }
                 h1 { color: #333; }
                 .section { 
@@ -397,6 +495,7 @@ class DisplayLibDemo:
                     padding: 15px; 
                     border: 1px solid #ddd; 
                     border-radius: 5px;
+                    transition: all 0.3s ease;
                 }
                 button { 
                     padding: 8px 15px; 
@@ -406,6 +505,7 @@ class DisplayLibDemo:
                     border: none; 
                     border-radius: 4px;
                     cursor: pointer;
+                    transition: background 0.3s ease;
                 }
                 button:hover { background: #005a9e; }
                 .result { 
@@ -413,6 +513,15 @@ class DisplayLibDemo:
                     padding: 10px; 
                     background: #f0f0f0; 
                     border-radius: 4px;
+                    min-height: 20px;
+                    transition: all 0.3s ease;
+                }
+                input[type="text"] {
+                    padding: 8px;
+                    margin: 5px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    width: 200px;
                 }
                 .dark-theme {
                     background-color: #333;
@@ -422,11 +531,24 @@ class DisplayLibDemo:
                     background: #444;
                     color: white;
                 }
+                .dark-theme .section {
+                    border-color: #666;
+                    background: #555;
+                }
+                .dark-theme .result {
+                    background: #666;
+                    color: white;
+                }
+                .dark-theme input[type="text"] {
+                    background: #555;
+                    color: white;
+                    border-color: #666;
+                }
             </style>
         </head>
-        <body>
+        <body class="light-theme">
             <div class="container">
-                <h1>DisplayLib Demo - Proper Bridge</h1>
+                <h1>DisplayLib Demo - Working Bridge</h1>
                 <p>This demo uses Qt WebChannel for proper Python-JavaScript communication.</p>
                 
                 <div class="section">
@@ -466,119 +588,6 @@ class DisplayLibDemo:
                     <div id="jsResults" class="result">Results will appear here</div>
                 </div>
             </div>
-
-            <script>
-            // Initialize DisplayLib when bridge is ready
-            window.initDisplayLib = function() {
-                console.log("DisplayLib initialized with bridge");
-                
-                // Load and display constants
-                document.getElementById('appName').textContent = DisplayLib.getConstant('APP_NAME') || 'Not found';
-                document.getElementById('version').textContent = DisplayLib.getConstant('VERSION') || 'Not found';
-                document.getElementById('maxItems').textContent = DisplayLib.getConstant('MAX_ITEMS') || 'Not found';
-                document.getElementById('piValue').textContent = DisplayLib.getConstant('PI') || 'Not found';
-                
-                updateDisplays();
-            };
-            
-            // Update variable displays
-            function updateDisplays() {
-                // Update from Python variables
-                const counter = DisplayLib.getVariable('counter');
-                const userName = DisplayLib.getVariable('userName');
-                const theme = DisplayLib.getVariable('theme');
-                const items = DisplayLib.getVariable('items');
-                
-                document.getElementById('counterValue').textContent = counter !== null ? counter : 'Error';
-                document.getElementById('userName').textContent = userName !== null ? userName : 'Error';
-                document.getElementById('currentTheme').textContent = theme !== null ? theme : 'Error';
-                
-                // Update items list
-                const itemsList = document.getElementById('itemsList');
-                itemsList.innerHTML = '';
-                if (items && Array.isArray(items)) {
-                    items.forEach(item => {
-                        const li = document.createElement('li');
-                        li.textContent = item;
-                        itemsList.appendChild(li);
-                    });
-                }
-                
-                // Apply theme
-                if (theme === 'dark') {
-                    document.body.classList.add('dark-theme');
-                } else {
-                    document.body.classList.remove('dark-theme');
-                }
-            }
-            
-            // Increment counter function
-            function incrementCounterHandler(amount) {
-                DisplayLib.callPython('incrementCounter', amount).then(() => {
-                    // Update display after Python operation
-                    updateDisplays();
-                    document.getElementById('jsResults').innerHTML = 
-                        `<p>Counter incremented by ${amount}</p>`;
-                }).catch(error => {
-                    document.getElementById('jsResults').innerHTML = 
-                        `<p>Error: ${error}</p>`;
-                });
-            }
-
-            // Reset counter
-            function resetCounter() {
-                DisplayLib.setVariable('counter', 0);
-                updateDisplays();
-                document.getElementById('jsResults').innerHTML = 
-                    `<p>Counter reset to 0</p>`;
-            }
-
-            // Toggle theme
-            function toggleTheme() {
-                const currentTheme = DisplayLib.getVariable('theme');
-                const newTheme = currentTheme === 'light' ? 'dark' : 'light';
-                DisplayLib.callPython('changeTheme', newTheme).then((success) => {
-                    if (success) {
-                        DisplayLib.setVariable('theme', newTheme);
-                        updateDisplays();
-                        document.getElementById('jsResults').innerHTML = 
-                            `<p>Theme changed to: ${newTheme}</p>`;
-                    }
-                });
-            }
-
-            // Add new item
-            function addNewItem() {
-                const input = document.getElementById('newItem');
-                const newItem = input.value.trim();
-                if (newItem) {
-                    DisplayLib.callPython('addItem', newItem).then((success) => {
-                        if (success) {
-                            input.value = '';
-                            updateDisplays();
-                            document.getElementById('jsResults').innerHTML = 
-                                `<p>Item '${newItem}' added successfully</p>`;
-                        } else {
-                            document.getElementById('jsResults').innerHTML = 
-                                `<p>Failed to add item: Maximum limit reached</p>`;
-                        }
-                    });
-                }
-            }
-
-            // Show message
-            function showMessageHandler() {
-                const input = document.getElementById('messageInput');
-                const message = input.value.trim();
-                if (message) {
-                    DisplayLib.callPython('showMessage', message).then((result) => {
-                        document.getElementById('jsResults').innerHTML = 
-                            `<p>${result}</p>`;
-                        input.value = '';
-                    });
-                }
-            }
-            </script>
         </body>
         </html>
         """
@@ -592,6 +601,7 @@ class DisplayLibDemo:
         
         print("=== DisplayLib Demo ===")
         print("Using Qt WebChannel for Python-JavaScript communication")
+        print("Bridge should now work properly!")
         
         # Run the application
         return self.app.exec_()
